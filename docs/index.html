@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Advanced CORS Auditor</title>
+  <style>
+    body { font-family: sans-serif; margin: 2em; background: #f9fafb; color: #111; }
+    input, select, textarea, button { margin-top: 5px; padding: 6px; width: 100%; }
+    .card { background: white; padding: 1em; border: 1px solid #ccc; border-radius: 8px; margin-bottom: 1em; }
+    pre { background: #f3f3f3; padding: 0.5em; overflow: auto; max-height: 200px; }
+    .high { color: red; font-weight: bold; }
+    .warn { color: orange; font-weight: bold; }
+    .info { color: green; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Advanced CORS Auditor</h1>
+  <p>For authorized testing only (bug bounty / pentest). Enter target URL and run checks.</p>
+
+  <div class="card">
+    <label>Target URL</label>
+    <input id="url" placeholder="https://victim.example.com/api" />
+
+    <label>Method</label>
+    <select id="method">
+      <option>GET</option>
+      <option>POST</option>
+    </select>
+
+    <label>Body (for POST)</label>
+    <textarea id="body" rows="3"></textarea>
+
+    <button onclick="runTests()">Run All Checks</button>
+  </div>
+
+  <div id="results"></div>
+
+  <script>
+    async function runFetch(url, opts, forcedOrigin) {
+      const start = performance.now();
+      let out = { ok:false, error:null, corsReadable:false, status:null, body:null, headers:{}, forcedOrigin };
+      try {
+        const headers = opts.headers || {};
+        if (forcedOrigin) headers["Origin"] = forcedOrigin;
+        opts.headers = headers;
+
+        const res = await fetch(url, opts);
+        out.status = res.status;
+        res.headers.forEach((v,k)=> out.headers[k.toLowerCase()] = v);
+        try {
+          out.body = await res.text();
+          out.corsReadable = true;
+          out.ok = res.ok;
+        } catch(e) {
+          out.error = e.message;
+        }
+      } catch(e) {
+        out.error = e.message;
+      }
+      out.time = Math.round(performance.now()-start);
+      return out;
+    }
+
+    function analyze(r, origin) {
+      let findings = [];
+      const acao = r.headers["access-control-allow-origin"];
+      const acc = r.headers["access-control-allow-credentials"];
+      const vary = r.headers["vary"];
+      const acam = r.headers["access-control-allow-methods"];
+      const acah = r.headers["access-control-allow-headers"];
+
+      if (acao) {
+        if (acao === "*") {
+          findings.push({level:"high", msg:"ACAO is *"});
+        }
+        if (origin && acao === origin) {
+          findings.push({level:"warn", msg:`ACAO reflects supplied origin (${origin})`});
+        }
+      }
+      if (acc === "true" && (acao === "*" || (origin && acao === origin))) {
+        findings.push({level:"high", msg:"ACAC true with permissive ACAO → credential theft possible"});
+      }
+      if (acao && !vary?.toLowerCase().includes("origin")) {
+        findings.push({level:"warn", msg:"ACAO dynamic but missing Vary: Origin"});
+      }
+      if (acam && /(delete|put|patch)/i.test(acam)) {
+        findings.push({level:"warn", msg:`Dangerous methods allowed: ${acam}`});
+      }
+      if (acah && (acah.includes("*") || acah.toLowerCase().includes("authorization"))) {
+        findings.push({level:"warn", msg:`Permissive headers allowed: ${acah}`});
+      }
+      if (findings.length === 0) {
+        findings.push({level:"info", msg:"No obvious misconfig detected"});
+      }
+      return findings;
+    }
+
+    async function runTests() {
+      const url = document.getElementById("url").value;
+      const method = document.getElementById("method").value;
+      const body = document.getElementById("body").value;
+      const resultsDiv = document.getElementById("results");
+      resultsDiv.innerHTML = "";
+
+      const testOrigins = [
+        {name:"Normal same-origin", val:window.location.origin},
+        {name:"Evil.com reflection", val:"https://evil.com"},
+        {name:"Null origin", val:"null"},
+        {name:"HTTPS w/ wrong port", val:"https://"+(new URL(url)).hostname+":1337"}
+      ];
+
+      for (const t of testOrigins) {
+        const r = await runFetch(url, {method, mode:"cors", credentials:"include", body:method!=="GET"?body:null}, t.val);
+        const findings = analyze(r, t.val);
+        const card = document.createElement("div");
+        card.className = "card";
+        card.innerHTML = `<h3>${t.name}</h3>
+          <p>Status: ${r.status} | Time: ${r.time}ms</p>
+          <h4>Findings</h4>
+          <ul>${findings.map(f=>`<li class='${f.level}'>[${f.level}] ${f.msg}</li>`).join("")}</ul>
+          <h4>Headers</h4><pre>${Object.entries(r.headers).map(([k,v])=>k+": "+v).join("\\n")}</pre>
+          <h4>Body (preview)</h4><pre>${r.corsReadable? r.body.substring(0,400) : "(not readable)"}</pre>`;
+        resultsDiv.appendChild(card);
+      }
+    }
+  </script>
+</body>
+</html>
