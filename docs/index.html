@@ -1,128 +1,154 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <title>Advanced CORS Auditor</title>
-  <style>
-    body { font-family: sans-serif; margin: 2em; background: #f9fafb; color: #111; }
-    input, select, textarea, button { margin-top: 5px; padding: 6px; width: 100%; }
-    .card { background: white; padding: 1em; border: 1px solid #ccc; border-radius: 8px; margin-bottom: 1em; }
-    pre { background: #f3f3f3; padding: 0.5em; overflow: auto; max-height: 200px; }
-    .high { color: red; font-weight: bold; }
-    .warn { color: orange; font-weight: bold; }
-    .info { color: green; font-weight: bold; }
-  </style>
+<meta charset="utf-8"/>
+<title>CORS Auditor (fixed)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;color:#0b1220;background:#f7fafc}
+  .card{background:#fff;padding:12px;border:1px solid #e6e9ef;border-radius:8px;margin-bottom:12px}
+  input,textarea,select,button{font-size:14px;padding:8px;border-radius:6px;border:1px solid #cbd5e1;width:100%;box-sizing:border-box}
+  pre{background:#0b1220;color:#e6eef8;padding:8px;border-radius:6px;overflow:auto;max-height:260px}
+  .small{font-size:13px;color:#475569}
+  .flag{display:inline-block;padding:6px;border-radius:999px;margin-right:6px;font-size:12px}
+  .high{background:#fee2e2;color:#991b1b;border:1px solid #fecaca}
+  .warn{background:#fff7ed;color:#92400e;border:1px solid #ffd8a8}
+  .ok{background:#ecfccb;color:#365314;border:1px solid #bbf7d0}
+</style>
 </head>
 <body>
-  <h1>Advanced CORS Auditor</h1>
-  <p>For authorized testing only (bug bounty / pentest). Enter target URL and run checks.</p>
+  <h2>CORS Auditor — browser checks + server-side curl generator</h2>
+  <p class="small">This page <strong>does not</strong> attempt to spoof Origin. For reflection tests, host the page on the origin you want the browser to send, or use the curl commands below.</p>
 
   <div class="card">
     <label>Target URL</label>
-    <input id="url" placeholder="https://victim.example.com/api" />
-
-    <label>Method</label>
-    <select id="method">
-      <option>GET</option>
-      <option>POST</option>
-    </select>
-
-    <label>Body (for POST)</label>
-    <textarea id="body" rows="3"></textarea>
-
-    <button onclick="runTests()">Run All Checks</button>
+    <input id="url" placeholder="https://identity.nba.com/api/v1/sts" />
+    <label style="margin-top:8px">Method</label>
+    <select id="method"><option>GET</option><option>POST</option></select>
+    <label style="margin-top:8px"><input id="withCreds" type="checkbox" checked/> Send cookies (credentials: include)</label>
+    <div style="margin-top:8px;display:flex;gap:8px">
+      <button onclick="runClientChecks()" style="flex:1">Run browser checks</button>
+      <button onclick="showCurl()" style="flex:1">Show curl diagnostic</button>
+    </div>
   </div>
 
-  <div id="results"></div>
+  <div id="out"></div>
 
-  <script>
-    async function runFetch(url, opts, forcedOrigin) {
-      const start = performance.now();
-      let out = { ok:false, error:null, corsReadable:false, status:null, body:null, headers:{}, forcedOrigin };
-      try {
-        const headers = opts.headers || {};
-        if (forcedOrigin) headers["Origin"] = forcedOrigin;
-        opts.headers = headers;
+<script>
+const origin = window.location.origin;
 
-        const res = await fetch(url, opts);
-        out.status = res.status;
-        res.headers.forEach((v,k)=> out.headers[k.toLowerCase()] = v);
-        try {
-          out.body = await res.text();
-          out.corsReadable = true;
-          out.ok = res.ok;
-        } catch(e) {
-          out.error = e.message;
-        }
-      } catch(e) {
-        out.error = e.message;
-      }
-      out.time = Math.round(performance.now()-start);
-      return out;
+function mkCard(title, innerHtml='') {
+  const c = document.createElement('div'); c.className='card';
+  c.innerHTML = `<strong>${title}</strong><div style="margin-top:8px">${innerHtml}</div>`;
+  return c;
+}
+
+async function safeFetch(url, fetchOpts = {}) {
+  const out = { status:null, type:null, ok:false, readable:false, headers:{}, body:null, error:null, timeMs:0 };
+  const start = performance.now();
+  try {
+    const res = await fetch(url, fetchOpts);
+    out.status = res.status;
+    out.type = res.type; // 'cors', 'basic', 'opaque', ...
+    // try to read headers that browser allows us to see
+    try { res.headers.forEach((v,k)=> out.headers[k.toLowerCase()] = v); } catch(e) {}
+    try {
+      out.body = await res.text();
+      out.readable = true;
+      out.ok = res.ok;
+    } catch(e) {
+      out.error = 'Body not readable (CORS or opaque) — ' + (e && e.message ? e.message : e);
     }
+  } catch(e) {
+    out.error = String(e);
+  }
+  out.timeMs = Math.round(performance.now()-start);
+  return out;
+}
 
-    function analyze(r, origin) {
-      let findings = [];
-      const acao = r.headers["access-control-allow-origin"];
-      const acc = r.headers["access-control-allow-credentials"];
-      const vary = r.headers["vary"];
-      const acam = r.headers["access-control-allow-methods"];
-      const acah = r.headers["access-control-allow-headers"];
+async function runClientChecks() {
+  const url = document.getElementById('url').value.trim();
+  if(!url) return alert('Enter a target URL');
+  const method = document.getElementById('method').value;
+  const includeCreds = document.getElementById('withCreds').checked;
+  const out = document.getElementById('out');
+  out.innerHTML = '';
 
-      if (acao) {
-        if (acao === "*") {
-          findings.push({level:"high", msg:"ACAO is *"});
-        }
-        if (origin && acao === origin) {
-          findings.push({level:"warn", msg:`ACAO reflects supplied origin (${origin})`});
-        }
-      }
-      if (acc === "true" && (acao === "*" || (origin && acao === origin))) {
-        findings.push({level:"high", msg:"ACAC true with permissive ACAO → credential theft possible"});
-      }
-      if (acao && !vary?.toLowerCase().includes("origin")) {
-        findings.push({level:"warn", msg:"ACAO dynamic but missing Vary: Origin"});
-      }
-      if (acam && /(delete|put|patch)/i.test(acam)) {
-        findings.push({level:"warn", msg:`Dangerous methods allowed: ${acam}`});
-      }
-      if (acah && (acah.includes("*") || acah.toLowerCase().includes("authorization"))) {
-        findings.push({level:"warn", msg:`Permissive headers allowed: ${acah}`});
-      }
-      if (findings.length === 0) {
-        findings.push({level:"info", msg:"No obvious misconfig detected"});
-      }
-      return findings;
-    }
+  // 1) Simple CORS fetch (omit credentials)
+  out.appendChild(mkCard('Simple CORS fetch (credentials: omit)', '<div class="small">Mode: cors — does the server allow cross-origin read?</div>'));
+  const simple = await safeFetch(url, { method, mode:'cors', credentials:'omit' });
+  appendResult(out, 'Simple', simple);
 
-    async function runTests() {
-      const url = document.getElementById("url").value;
-      const method = document.getElementById("method").value;
-      const body = document.getElementById("body").value;
-      const resultsDiv = document.getElementById("results");
-      resultsDiv.innerHTML = "";
+  // 2) Credentialed fetch (include)
+  out.appendChild(mkCard('Credentialed CORS fetch (credentials: include)', '<div class="small">Mode: cors with cookies — server must set ACAO to your origin and set AC-Allow-Credentials:true</div>'));
+  const cred = await safeFetch(url, { method, mode:'cors', credentials: includeCreds ? 'include' : 'omit' });
+  appendResult(out, 'Credentialed', cred);
 
-      const testOrigins = [
-        {name:"Normal same-origin", val:window.location.origin},
-        {name:"Evil.com reflection", val:"https://evil.com"},
-        {name:"Null origin", val:"null"},
-        {name:"HTTPS w/ wrong port", val:"https://"+(new URL(url)).hostname+":1337"}
-      ];
+  // 3) Preflight-trigger fetch (custom header)
+  out.appendChild(mkCard('Fetch with custom header (preflight trigger)', '<div class="small">This will cause browser preflight (OPTIONS). If preflight fails, main request is blocked.</div>'));
+  const pre = await safeFetch(url, { method, mode:'cors', credentials: includeCreds ? 'include' : 'omit', headers: { 'X-Cors-Tester': '1' }, body: method==='GET' ? undefined : '' });
+  appendResult(out, 'Preflight-trigger', pre);
 
-      for (const t of testOrigins) {
-        const r = await runFetch(url, {method, mode:"cors", credentials:"include", body:method!=="GET"?body:null}, t.val);
-        const findings = analyze(r, t.val);
-        const card = document.createElement("div");
-        card.className = "card";
-        card.innerHTML = `<h3>${t.name}</h3>
-          <p>Status: ${r.status} | Time: ${r.time}ms</p>
-          <h4>Findings</h4>
-          <ul>${findings.map(f=>`<li class='${f.level}'>[${f.level}] ${f.msg}</li>`).join("")}</ul>
-          <h4>Headers</h4><pre>${Object.entries(r.headers).map(([k,v])=>k+": "+v).join("\\n")}</pre>
-          <h4>Body (preview)</h4><pre>${r.corsReadable? r.body.substring(0,400) : "(not readable)"}</pre>`;
-        resultsDiv.appendChild(card);
-      }
-    }
-  </script>
+  // 4) No-CORS mode (opaque)
+  out.appendChild(mkCard('no-cors mode (opaque response check)', '<div class="small">Opaque responses are unreadable by JS but still allow resource load in some cases.</div>'));
+  const opaque = await safeFetch(url, { method, mode:'no-cors', credentials: includeCreds ? 'include' : 'omit' });
+  appendResult(out, 'No-CORS (opaque)', opaque);
+
+  // guide
+  const guide = document.createElement('div');
+  guide.className='card';
+  guide.innerHTML = `<div class="small">
+    <strong>Notes</strong>
+    <ul>
+      <li>If <em>any</em> of the above fetches show <code>readable: true</code> and the returned headers include <code>access-control-allow-origin</code> matching your origin or <code>*</code>, the server allowed JS to read the response.</li>
+      <li>If all reads are blocked (body not readable / opaque) then the server did not include permissive CORS headers for your page origin.</li>
+      <li>To <strong>confirm server-side headers</strong>, click "Show curl diagnostic" and run the printed curl commands on your machine or a server you control.</li>
+      <li>Open your browser DevTools Console to see denial messages (e.g., CORS errors) — helpful for troubleshooting.</li>
+    </ul>
+  </div>`;
+  out.appendChild(guide);
+}
+
+function appendResult(container, label, res) {
+  const block = document.createElement('div');
+  block.style.marginTop = '6px';
+  const flags = [];
+  if(res.readable) flags.push(`<span class="flag ok">readable</span>`);
+  else flags.push(`<span class="flag warn">not readable</span>`);
+  if(res.error) flags.push(`<span class="flag warn">error</span>`);
+  block.innerHTML = `<div style="font-weight:600">${label} — status: ${res.status ?? '-'} — type: ${res.type ?? '-'} — ${res.timeMs}ms</div>
+    <div style="margin-top:6px">${flags.join(' ')}</div>
+    <div style="margin-top:8px"><strong>Headers (what browser can see)</strong>
+      <pre>${Object.entries(res.headers).length ? Object.entries(res.headers).map(([k,v]) => k+': '+v).join('\\n') : '(none readable)'}</pre>
+    </div>
+    <div style="margin-top:8px"><strong>Body preview</strong><pre>${res.readable ? escapeHtml(res.body?.slice(0,2000) ?? '') : '(not readable / opaque)'}</pre></div>
+    ${res.error ? `<div style="margin-top:8px;color:#b44">${escapeHtml(res.error)}</div>` : ''}`;
+  container.appendChild(block);
+}
+
+function escapeHtml(s){ return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;'); }
+
+function showCurl() {
+  const url = document.getElementById('url').value.trim();
+  if(!url) return alert('Enter a target URL');
+  // choose an "attacker" origin to demonstrate; use your GitHub Pages origin or a placeholder
+  const attackerOrigin = origin; // the origin where this page is hosted, likely your GH pages URL
+  // 1) Basic GET with Origin header (server-side diagnostic)
+  const cmd1 = `curl -i -s -H "Origin: ${attackerOrigin}" "${url}"`;
+  // 2) OPTIONS preflight simulation (server-side)
+  const cmd2 = `curl -i -s -X OPTIONS -H "Origin: ${attackerOrigin}" -H "Access-Control-Request-Method: POST" -H "Access-Control-Request-Headers: X-Cors-Tester" "${url}"`;
+  // 3) Credentialed test (send cookies) (server-side)
+  const cmd3 = `curl -i -s -b "name=val" -H "Origin: ${attackerOrigin}" "${url}"`;
+  const out = document.getElementById('out');
+  out.prepend(mkCard('Server-side diagnostic curl commands (run from terminal)', `
+    <div class="small">Run these on your machine or an authorized server to inspect the raw response headers (no browser CORS limits).</div>
+    <pre>${escapeHtml(cmd1)}</pre>
+    <div class="small" style="margin-top:8px">To inspect preflight/OPTIONS response (Access-Control-Allow-Methods / -Headers):</div>
+    <pre>${escapeHtml(cmd2)}</pre>
+    <div class="small" style="margin-top:8px">To simulate a cookie-bearing request server-side (curl example):</div>
+    <pre>${escapeHtml(cmd3)}</pre>
+  `));
+}
+</script>
 </body>
 </html>
